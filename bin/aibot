@@ -1,0 +1,411 @@
+#!/usr/bin/env bash
+# aibot - control tool installed by aibot-hostkit (MIT). Zero telemetry.
+set -uo pipefail
+
+AIBOT_VERSION="0.1.0"
+AIBOT_HOME="${AIBOT_HOME:-$HOME/.aibot}"
+# 路徑會寫進 cron／systemd／tmux 指令列:只准一般字元,免得被當成指令或被 cron 的 % 拆行
+case "$AIBOT_HOME" in ""|*[!A-Za-z0-9._/-]*) echo "AIBOT_HOME may only contain letters, digits, . _ / - (got: $AIBOT_HOME)" >&2; exit 2 ;; esac
+export PATH="$AIBOT_HOME/bin:$HOME/.local/bin:/usr/local/bin:/usr/bin:/bin:$PATH"
+MARK="# aibot-hostkit"
+
+load() {
+  AIBOT_WORK="$HOME/work"
+  AIBOT_NAME="$(hostname 2>/dev/null || echo aibot)"
+  AIBOT_SESSION="aibot"
+  AIBOT_LANG="en"
+  AIBOT_CHANNELS=""
+  AIBOT_GUARD_MODE=""
+  AIBOT_CLAUDE_CMD="claude"
+  AIBOT_AGENT="claude"
+  AIBOT_CMD=""
+  AIBOT_CODEX_CMD="codex"
+  AIBOT_GEMINI_CMD="gemini"
+  AIBOT_NTFY_SERVER="https://ntfy.sh"
+  AIBOT_TG_TOKEN="" AIBOT_TG_CHAT="" AIBOT_NTFY_TOPIC="" AIBOT_DISCORD_WEBHOOK="" AIBOT_LINE_TOKEN="" AIBOT_LINE_USER=""
+  # shellcheck source=/dev/null
+  [ -f "$AIBOT_HOME/config.env" ] && . "$AIBOT_HOME/config.env"
+  # shellcheck source=/dev/null
+  [ -f "$AIBOT_HOME/secrets.env" ] && . "$AIBOT_HOME/secrets.env"
+  mkdir -p "$AIBOT_HOME/logs" "$AIBOT_HOME/state"
+  return 0
+}
+
+# m "中文" "English": pick by configured language
+m() { if [ "$AIBOT_LANG" = zh ]; then printf '%s' "$1"; else printf '%s' "$2"; fi; }
+say() { printf '%s\n' "$(m "$1" "$2")"; }
+log() { printf '%s %s\n' "$(date '+%F %T')" "$*" >>"$AIBOT_HOME/logs/guard.log"; }
+have() { command -v "$1" >/dev/null 2>&1; }
+now() { date +%s; }
+
+# ---------- notify ----------
+json_esc() {
+  printf '%s' "$1" | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g' -e 's/\t/\\t/g' | sed -e ':a;N;$!ba;s/\n/\\n/g'
+}
+has_channel() { case ",$AIBOT_CHANNELS," in *",$1,"*) return 0 ;; esac; return 1; }
+
+send_telegram() {
+  printf 'url = "https://api.telegram.org/bot%s/sendMessage"\n' "$AIBOT_TG_TOKEN" |
+    curl -fsS -m 15 -o /dev/null -K - --data-urlencode "chat_id=$AIBOT_TG_CHAT" --data-urlencode "text=$1" 2>/dev/null
+}
+send_ntfy() {
+  printf 'url = "%s/%s"\n' "${AIBOT_NTFY_SERVER%/}" "$AIBOT_NTFY_TOPIC" |
+    curl -fsS -m 15 -o /dev/null -K - -H "Title: aibot" -d "$1" 2>/dev/null
+}
+send_discord() {
+  local msg="${1:0:1800}"
+  printf 'url = "%s"\n' "$AIBOT_DISCORD_WEBHOOK" |
+    curl -fsS -m 15 -o /dev/null -K - -H 'Content-Type: application/json' -d "{\"content\":\"$(json_esc "$msg")\"}" 2>/dev/null
+}
+send_line() {
+  local msg="${1:0:4500}"
+  printf 'url = "https://api.line.me/v2/bot/message/push"\nheader = "Authorization: Bearer %s"\n' "$AIBOT_LINE_TOKEN" |
+    curl -fsS -m 15 -o /dev/null -K - -H 'Content-Type: application/json' \
+      -d "{\"to\":\"$AIBOT_LINE_USER\",\"messages\":[{\"type\":\"text\",\"text\":\"$(json_esc "$msg")\"}]}" 2>/dev/null
+}
+
+# notify_all "msg": send to every configured channel; returns number of failures
+notify_all() {
+  local msg="$1" fails=0 ch
+  for ch in telegram ntfy discord line; do
+    has_channel "$ch" || continue
+    if "send_$ch" "$msg"; then
+      printf '%s: ok\n' "$ch"
+    else
+      printf '%s: FAILED\n' "$ch"
+      fails=$((fails + 1))
+    fi
+  done
+  return "$fails"
+}
+
+cmd_notify() {
+  [ $# -ge 1 ] || { say "用法: aibot notify \"訊息\"" 'usage: aibot notify "message"'; return 2; }
+  if [ -z "$AIBOT_CHANNELS" ]; then
+    say "尚未設定任何通知通道（重跑安裝器並選 notify-*）" "No notification channel configured (re-run the installer with notify-*)"
+    return 1
+  fi
+  notify_all "$*"
+}
+
+# notify_limited key msg : at most one notification per key per 10 minutes
+notify_limited() {
+  local key="$1" msg="$2" f last t
+  f="$AIBOT_HOME/state/notify_$key"
+  t=$(now)
+  last=$(cat "$f" 2>/dev/null || echo 0)
+  if [ $((t - last)) -lt 600 ]; then
+    log "notify suppressed ($key)"
+    return 0
+  fi
+  echo "$t" >"$f"
+  if [ -z "$AIBOT_CHANNELS" ]; then
+    log "notify skipped, no channel ($key)"
+    return 0
+  fi
+  if notify_all "$msg" >/dev/null; then log "notify sent ($key)"; else log "notify failed ($key)"; fi
+}
+
+tg_chatid() {
+  local resp id
+  [ -n "$AIBOT_TG_TOKEN" ] || { echo "no token" >&2; return 1; }
+  resp=$(printf 'url = "https://api.telegram.org/bot%s/getUpdates"\n' "$AIBOT_TG_TOKEN" | curl -fsS -m 15 -K - 2>/dev/null) || return 1
+  id=$(printf '%s' "$resp" | grep -o '"chat":{"id":-\?[0-9]*' | tail -n 1 | grep -o -- '-\?[0-9]*$')
+  [ -n "$id" ] || return 1
+  printf '%s\n' "$id"
+}
+
+# ---------- tmux session ----------
+sess_up() { tmux has-session -t "$AIBOT_SESSION" 2>/dev/null; }
+agent_win_ok() {
+  local dead
+  dead=$(tmux list-panes -t "$AIBOT_SESSION:agent" -F '#{pane_dead}' 2>/dev/null | head -n 1) || return 1
+  [ "$dead" = 0 ]
+}
+# which program the tmux session keeps alive: custom command > AIBOT_AGENT (claude|codex|gemini)
+agent_kind() { if [ -n "$AIBOT_CMD" ]; then echo custom; else echo "$AIBOT_AGENT"; fi; }
+agent_cmdline() {
+  case "$(agent_kind)" in
+    custom) printf 'exec %s' "$AIBOT_CMD" ;;
+    codex) printf 'exec %q' "$AIBOT_CODEX_CMD" ;;
+    gemini) printf 'exec %q' "$AIBOT_GEMINI_CMD" ;;
+    *) printf 'exec %q --remote-control %q' "$AIBOT_CLAUDE_CMD" "$AIBOT_NAME" ;;
+  esac
+}
+guard_win_ok() { tmux list-windows -t "$AIBOT_SESSION" -F '#{window_name}' 2>/dev/null | grep -qx guard; }
+ensure_guard_window() {
+  [ "$AIBOT_GUARD_MODE" = tmux ] || return 0
+  guard_win_ok || tmux new-window -d -t "$AIBOT_SESSION:" -n guard "env AIBOT_HOME=$AIBOT_HOME $AIBOT_HOME/bin/aibot guard-loop"
+}
+# ensure_session: 0 = was fine, 10 = session recreated, 11 = agent window recreated
+ensure_session() {
+  mkdir -p "$AIBOT_WORK"
+  if ! sess_up; then
+    tmux new-session -d -s "$AIBOT_SESSION" -n agent -c "$AIBOT_WORK" "$(agent_cmdline)" || return 1
+    ensure_guard_window
+    return 10
+  fi
+  if ! agent_win_ok; then
+    tmux kill-window -t "$AIBOT_SESSION:agent" 2>/dev/null
+    tmux new-window -d -t "$AIBOT_SESSION:" -n agent -c "$AIBOT_WORK" "$(agent_cmdline)" || return 1
+    ensure_guard_window
+    return 11
+  fi
+  ensure_guard_window
+  return 0
+}
+cmd_exists() { case "$1" in */*) [ -x "$1" ] ;; *) have "$1" ;; esac; }
+agent_name() { # human-readable name + command word
+  # shellcheck disable=SC2086
+  case "$(agent_kind)" in
+    custom) set -- $AIBOT_CMD; echo "$1" ;;
+    codex) echo "$AIBOT_CODEX_CMD" ;;
+    gemini) echo "$AIBOT_GEMINI_CMD" ;;
+    *) echo "$AIBOT_CLAUDE_CMD" ;;
+  esac
+}
+agent_present() { [ -n "$(agent_name)" ] && cmd_exists "$(agent_name)"; }
+
+log_change() { # log_change key msg : log only when the message for the key changes
+  local f="$AIBOT_HOME/state/last_$1"
+  [ "$(cat "$f" 2>/dev/null)" = "$2" ] && return 0
+  printf '%s' "$2" >"$f"
+  log "$2"
+}
+
+guard_tick() {
+  touch "$AIBOT_HOME/state/guard.hb"
+  [ -e "$AIBOT_HOME/state/stopped" ] && return 0
+  have tmux || { log_change env "tmux not found, cannot guard"; return 0; }
+  agent_present || { log_change env "agent command not found ($(agent_name)); set AIBOT_CMD or install the AI CLI, cannot guard"; return 0; }
+  log_change env "environment ok"
+  ensure_session
+  case $? in
+    10) log "session '$AIBOT_SESSION' was missing -> recreated"
+        notify_limited session "[$AIBOT_NAME] tmux session was missing, restarted $(agent_kind)" ;;
+    11) log "agent process was gone -> restarted"
+        notify_limited agent "[$AIBOT_NAME] the $(agent_kind) process was gone, restarted it" ;;
+    0) : ;;
+    *) log "failed to (re)create session" ;;
+  esac
+  return 0
+}
+
+guard_loop() {
+  local interval="${AIBOT_GUARD_INTERVAL:-60}"
+  while true; do
+    load
+    guard_tick
+    sleep "$interval"
+  done
+}
+
+# ---------- user commands ----------
+cmd_start() {
+  have tmux || { say "找不到 tmux，請先安裝" "tmux not found, install it first"; return 1; }
+  agent_present || { say "找不到要常駐的程式（$(agent_name)）；請安裝 AI 工具或設定 AIBOT_CMD" "program to keep alive not found ($(agent_name)); install the AI CLI or set AIBOT_CMD"; return 1; }
+  rm -f "$AIBOT_HOME/state/stopped"
+  ensure_session
+  case $? in
+    0) say "已在執行中" "already running" ;;
+    10 | 11) say "已啟動（tmux 工作階段: $AIBOT_SESSION）" "started (tmux session: $AIBOT_SESSION)" ;;
+    *) say "啟動失敗，請看 aibot logs" "failed to start, see aibot logs"; return 1 ;;
+  esac
+}
+cmd_stop() {
+  touch "$AIBOT_HOME/state/stopped"
+  tmux kill-session -t "$AIBOT_SESSION" 2>/dev/null
+  say "已停止（看守暫停，aibot start 可恢復）" "stopped (guard paused; run 'aibot start' to resume)"
+}
+cmd_restart() {
+  tmux kill-session -t "$AIBOT_SESSION" 2>/dev/null
+  cmd_start
+}
+
+hb_age() {
+  local f="$AIBOT_HOME/state/guard.hb" t
+  [ -f "$f" ] || { echo 99999; return; }
+  t=$(stat -c %Y "$f" 2>/dev/null || echo 0)
+  echo $(($(now) - t))
+}
+
+guard_alive() {
+  case "$AIBOT_GUARD_MODE" in
+    cron) crontab -l 2>/dev/null | grep -q "$MARK" ;;
+    systemd) systemctl --user is-active aibot-guard.timer >/dev/null 2>&1 ;;
+    tmux) guard_win_ok ;;
+    *) return 1 ;;
+  esac
+}
+
+cmd_status() {
+  printf 'aibot %s  [%s]\n' "$AIBOT_VERSION" "$AIBOT_NAME"
+  printf '%s %s\n' "$(m '工作目錄:' 'work dir:')" "$AIBOT_WORK"
+  if [ -e "$AIBOT_HOME/state/stopped" ]; then say "狀態: 已手動停止" "state: stopped by user"; fi
+  if have tmux && sess_up; then
+    if agent_win_ok; then say "工作階段: 執行中，$(agent_kind) 運作中" "session: up, $(agent_kind) running"
+    else say "工作階段: 在，但 $(agent_kind) 不在" "session: up, but $(agent_kind) is not running"; fi
+  else
+    say "工作階段: 不在" "session: down"
+  fi
+  printf '%s %s (%s %ss)\n' "$(m '看守:' 'guard:')" "${AIBOT_GUARD_MODE:-none}" "$(m '上次心跳' 'last beat')" "$(hb_age)"
+  printf '%s %s\n' "$(m '通知通道:' 'channels:')" "${AIBOT_CHANNELS:-none}"
+}
+
+cmd_logs() {
+  local which="guard" follow=0 a f
+  for a in "$@"; do
+    case "$a" in -f) follow=1 ;; guard | install) which="$a" ;; esac
+  done
+  f="$AIBOT_HOME/logs/$which.log"
+  [ -f "$f" ] || { say "還沒有紀錄: $f" "no log yet: $f"; return 0; }
+  if [ "$follow" = 1 ]; then tail -n 50 -f "$f"; else tail -n 50 "$f"; fi
+}
+
+D_OK=0 D_WARN=0 D_FAIL=0
+chk() { # chk ok|warn|fail "msg"
+  case "$1" in
+    ok) printf '  [ OK ] %s\n' "$2"; D_OK=$((D_OK + 1)) ;;
+    warn) printf '  [WARN] %s\n' "$2"; D_WARN=$((D_WARN + 1)) ;;
+    *) printf '  [FAIL] %s\n' "$2"; D_FAIL=$((D_FAIL + 1)) ;;
+  esac
+}
+
+cmd_doctor() {
+  D_OK=0 D_WARN=0 D_FAIL=0
+  local perm age code
+  say "aibot 健檢" "aibot doctor"
+  if have tmux; then chk ok "tmux: $(tmux -V)"; else chk fail "$(m 'tmux 未安裝' 'tmux not installed')"; fi
+  if agent_present; then chk ok "$(m '常駐程式存在' 'program to keep alive found') ($(agent_kind)): $(agent_name)"
+  else chk fail "$(m '常駐程式不存在' 'program to keep alive missing') ($(agent_kind)): $(agent_name)"; fi
+  if [ "$(agent_kind)" != claude ]; then
+    :
+  elif [ -f "$HOME/.claude/.credentials.json" ] || grep -qs '"oauthAccount"' "$HOME/.claude.json"; then
+    chk ok "$(m 'Claude 看起來已登入' 'Claude login looks present')"
+  else
+    chk warn "$(m '看不出 Claude 是否已登入（請 tmux attach -t aibot 照畫面登入）' 'cannot tell if Claude is logged in (run: tmux attach -t aibot and follow the login prompt)')"
+  fi
+  if [ -e "$AIBOT_HOME/state/stopped" ]; then
+    chk warn "$(m '已被手動停止（aibot start 可恢復）' "stopped by user ('aibot start' to resume)")"
+  elif have tmux && sess_up; then
+    chk ok "$(m "tmux 工作階段 $AIBOT_SESSION 存在" "tmux session $AIBOT_SESSION exists")"
+    if agent_win_ok; then chk ok "$(m '常駐視窗運作中' 'agent window alive')"; else chk fail "$(m '常駐視窗不在' 'agent window not running')"; fi
+  else
+    chk fail "$(m "tmux 工作階段 $AIBOT_SESSION 不存在" "tmux session $AIBOT_SESSION missing")"
+  fi
+  if [ -z "$AIBOT_GUARD_MODE" ]; then
+    chk warn "$(m '尚未安裝看守（--with guard）' 'guard not installed (--with guard)')"
+  elif guard_alive; then
+    age=$(hb_age)
+    if [ "$age" -le 180 ]; then chk ok "$(m "看守 ($AIBOT_GUARD_MODE) 運作中，${age} 秒前有心跳" "guard ($AIBOT_GUARD_MODE) running, last beat ${age}s ago")"
+    else chk fail "$(m "看守已登記但 ${age} 秒沒心跳（排程程式沒在跑？）" "guard registered but no beat for ${age}s (is the scheduler running?)")"; fi
+  else
+    chk fail "$(m "看守 ($AIBOT_GUARD_MODE) 沒有在運作" "guard ($AIBOT_GUARD_MODE) not active")"
+  fi
+  if [ -n "$AIBOT_CHANNELS" ]; then chk ok "$(m '通知通道' 'notify channels'): $AIBOT_CHANNELS"; else chk warn "$(m '沒有設定通知通道' 'no notify channel configured')"; fi
+  if [ -f "$AIBOT_HOME/secrets.env" ]; then
+    perm=$(stat -c %a "$AIBOT_HOME/secrets.env" 2>/dev/null)
+    if [ "$perm" = 600 ]; then chk ok "secrets.env 600"; else chk fail "secrets.env $(m '權限應為 600，目前' 'must be 600, is') $perm"; fi
+  fi
+  if [ "$(agent_kind)" != claude ]; then
+    :
+  elif have curl; then
+    code=$(curl -s -o /dev/null -m 10 -w '%{http_code}' https://claude.ai 2>/dev/null || true)
+    case "$code" in
+      000 | "") chk warn "$(m '連不到 claude.ai' 'cannot reach claude.ai')" ;;
+      *) chk ok "$(m '連得到 claude.ai' 'claude.ai reachable') (HTTP $code)" ;;
+    esac
+  else
+    chk fail "$(m 'curl 未安裝' 'curl not installed')"
+  fi
+  printf '%s: ok=%d warn=%d fail=%d\n' "$(m '結果' 'result')" "$D_OK" "$D_WARN" "$D_FAIL"
+  [ "$D_FAIL" -eq 0 ]
+}
+
+confirm_tty() { # confirm_tty "prompt" ; needs a real tty
+  local ans
+  { : </dev/tty; } 2>/dev/null || return 1
+  printf '%s [y/N] ' "$1" >/dev/tty
+  read -r ans </dev/tty || return 1
+  case "$ans" in y | Y | yes) return 0 ;; esac
+  return 1
+}
+
+strip_mark() { # strip_mark file : delete our marked lines, keep mode/owner
+  local f="$1" tmp
+  [ -f "$f" ] || return 0
+  grep -q "$MARK" "$f" 2>/dev/null || return 0
+  tmp=$(mktemp)
+  grep -v "$MARK" "$f" >"$tmp" || true
+  cat "$tmp" >"$f"
+  rm -f "$tmp"
+}
+
+cmd_uninstall() {
+  local yes=0 a
+  for a in "$@"; do
+    if [ "$a" = "--yes" ] || [ "$a" = "-y" ]; then yes=1; fi
+  done
+  say "將會移除（只移除 aibot 建立的東西）:" "Will remove (only things aibot created):"
+  say "  - 看守排程（crontab / systemd --user / tmux guard 視窗）" "  - guard schedule (crontab / systemd --user / tmux guard window)"
+  say "  - tmux 工作階段 $AIBOT_SESSION" "  - tmux session $AIBOT_SESSION"
+  say "  - 資料夾 $AIBOT_HOME（設定、秘密、紀錄）" "  - folder $AIBOT_HOME (config, secrets, logs)"
+  say "  - ~/.bashrc 與 ~/.profile 裡標記 aibot-hostkit 的 PATH 行" "  - the aibot-hostkit PATH lines in ~/.bashrc and ~/.profile"
+  say "不會移除: Claude Code 本體、tmux 套件、$AIBOT_WORK 裡你的檔案（含 CLAUDE.md）" "NOT removed: Claude Code itself, the tmux package, your files in $AIBOT_WORK (incl. CLAUDE.md)"
+  if [ "$yes" -ne 1 ]; then
+    confirm_tty "$(m '確定移除？' 'Remove now?')" || { say "已取消（非互動請加 --yes）" "cancelled (use --yes when non-interactive)"; return 1; }
+  fi
+  if have crontab && crontab -l 2>/dev/null | grep -q "$MARK"; then
+    { crontab -l 2>/dev/null | grep -v "$MARK" || true; } | crontab - 2>/dev/null || true
+  fi
+  if have systemctl; then
+    systemctl --user disable --now aibot-guard.timer >/dev/null 2>&1 || true
+    rm -f "$HOME/.config/systemd/user/aibot-guard.service" "$HOME/.config/systemd/user/aibot-guard.timer"
+    systemctl --user daemon-reload >/dev/null 2>&1 || true
+  fi
+  tmux kill-session -t "$AIBOT_SESSION" 2>/dev/null || true
+  strip_mark "$HOME/.bashrc"
+  strip_mark "$HOME/.profile"
+  # 只刪 aibot 自己建的資料夾:路徑是空的、/、家目錄,或裡面沒有安裝標記 → 拒刪(防 AIBOT_HOME 被設錯把整個家目錄刪掉)
+  case "${AIBOT_HOME%/}" in ""|"/"|"${HOME%/}") say "拒絕刪除：$AIBOT_HOME 不是 aibot 的資料夾" "Refusing to delete $AIBOT_HOME: not an aibot folder"; return 1 ;; esac
+  if [ ! -f "$AIBOT_HOME/.aibot-hostkit" ]; then say "拒絕刪除：$AIBOT_HOME 沒有 aibot 安裝標記" "Refusing to delete $AIBOT_HOME: no aibot install marker"; return 1; fi
+  rm -rf "$AIBOT_HOME"
+  say "已移除。" "Removed."
+}
+
+usage() {
+  cat <<EOF
+aibot $AIBOT_VERSION
+  status           show session / guard / channels
+  start | stop | restart
+  logs [guard|install] [-f]
+  notify "message" send to all configured channels
+  doctor           health check
+  tg-chatid        find your Telegram chat id (message your bot first)
+  uninstall [--yes]
+EOF
+}
+
+main() {
+  local cmd="${1:-help}"
+  [ $# -gt 0 ] && shift
+  load
+  case "$cmd" in
+    status) cmd_status ;;
+    start) cmd_start ;;
+    stop) cmd_stop ;;
+    restart) cmd_restart ;;
+    logs) cmd_logs "$@" ;;
+    notify) cmd_notify "$@" ;;
+    doctor) cmd_doctor ;;
+    uninstall) cmd_uninstall "$@" ;;
+    guard-tick) guard_tick ;;
+    guard-loop) guard_loop ;;
+    tg-chatid) tg_chatid ;;
+    version | --version) echo "$AIBOT_VERSION" ;;
+    *) usage ;;
+  esac
+}
+
+main "$@"
+exit $?

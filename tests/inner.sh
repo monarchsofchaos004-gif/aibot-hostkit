@@ -25,7 +25,7 @@ export AIBOT_CLAUDE_CMD=/tmp/aibot-shim/claude
 
 # ---- 1. --plan
 out=$(bash "$SRC/install.sh" --plan --lang en 2>&1)
-case "$out" in *"[tmux]"*"[notify-line]"*"[uninstall]"*) pass "--plan lists components" ;; *) fail "--plan lists components" ;; esac
+case "$out" in *"[tmux]"*"[notify-line]"*"[shared]"*"[uninstall]"*) pass "--plan lists components" ;; *) fail "--plan lists components" ;; esac
 out=$(bash "$SRC/install.sh" --plan --lang zh 2>&1)
 case "$out" in *"使用者要準備"*) pass "--plan zh" ;; *) fail "--plan zh" ;; esac
 
@@ -141,7 +141,7 @@ case "$out" in *"component=notify-discord status=skipped"*) pass "missing env se
 if command -v script >/dev/null 2>&1; then
   rm -f "$HOME/work/CLAUDE.md" "$HOME/work/CLAUDE.aibot.md"
   # answers are typed slowly: sudo/tcsetattr flushes input typed ahead during the preflight
-  { sleep 8; for a in n n n n n n n n n n y; do printf '%s\n' "$a"; sleep 0.4; done; sleep 2; } |
+  { sleep 8; for a in n n n n n n n n n n y n; do printf '%s\n' "$a"; sleep 0.4; done; sleep 2; } |
     timeout 90 script -qec "bash $SRC/install.sh --lang en" /dev/null >/tmp/inter_"$LABEL".out 2>&1
   ok_if "interactive (tty) run installed rules only" test -s "$HOME/work/CLAUDE.md"
 fi
@@ -181,6 +181,155 @@ if [ "$HAS_SUDO" = 1 ]; then
   "$AIBOT" doctor >/dev/null 2>&1 && pass "noai: doctor ok" || fail "noai: doctor ok"
 fi
 
+# ---- 9c. aibot audit: runs ONLY here, in this throw-away container, on a FAKE home full of fake secrets
+S=SENTINEL_FAKE_
+F=$(mktemp -d)
+mk() { # mk relpath content [mode]
+  mkdir -p "$(dirname "$F/$1")"
+  printf '%s\n' "$2" >"$F/$1"
+  chmod "${3:-600}" "$F/$1"
+}
+mkdir -p "$F/.ssh"
+printf -- '-----BEGIN RSA PRIVATE KEY-----\n%sssh_rsa_body\n-----END RSA PRIVATE KEY-----\n' "$S" >"$F/.ssh/id_rsa"
+chmod 644 "$F/.ssh/id_rsa" # the ONE file that is readable by others
+printf -- '-----BEGIN OPENSSH PRIVATE KEY-----\n%s\nAAAAAAAA\n%sssh_ed_body\n-----END OPENSSH PRIVATE KEY-----\n' \
+  "$(printf 'openssh-key-v1\0\0\0\0\4none\0\0\0\4none\0\0\0\0\0' | base64 -w0)" "$S" >"$F/.ssh/id_ed25519"
+chmod 600 "$F/.ssh/id_ed25519"
+printf -- '-----BEGIN RSA PRIVATE KEY-----\nProc-Type: 4,ENCRYPTED\nDEK-Info: AES-128-CBC,%sdek\n%sbody\n-----END RSA PRIVATE KEY-----\n' "$S" "$S" >"$F/.ssh/id_enc"
+chmod 600 "$F/.ssh/id_enc"
+printf 'ssh-ed25519 %skey1 a@b\nssh-ed25519 %skey2 c@d\n' "$S" "$S" >"$F/.ssh/authorized_keys"
+chmod 600 "$F/.ssh/authorized_keys"
+mk .config/gh/hosts.yml "github.com: oauth_token: ${S}gh"
+mk .git-credentials "https://u:${S}git@example.com"
+mk .netrc "machine x password ${S}netrc"
+mk .aws/credentials "aws_access_key_id=${S}aws"
+mk .config/gcloud/application_default_credentials.json "${S}gcloud"
+mk .azure/msal_token_cache.json "${S}azure"
+{ printf '%s\n' "${S}kube"; head -c 1100000 /dev/zero | tr '\0' 'a'; echo; } >"$F/.kube-big"
+mkdir -p "$F/.kube" && mv "$F/.kube-big" "$F/.kube/config" && chmod 600 "$F/.kube/config"
+mk .docker/config.json "{\"auths\": {\"r.example\": {\"auth\": \"${S}docker\"}}}"
+mk .npmrc "//registry.example/:_authToken=${S}npm"
+printf '%s\n' "${S}outside_home" >"/tmp/outside_$LABEL"
+ln -s "/tmp/outside_$LABEL" "$F/.pypirc"
+mk .cargo/credentials.toml "token = \"${S}cargo\""
+mk .config/rclone/rclone.conf "token = ${S}rclone"
+mk .claude/.credentials.json "${S}claude"
+mk .codex/auth.json "${S}codex"
+mk .gemini/oauth_creds.json "${S}gemini"
+mk .aibot/secrets.env "AIBOT_NTFY_TOPIC=${S}ntfy"
+mkdir -p "$F/.config/google-chrome/Default" "$F/.config/google-chrome/Profile 1" "$F/.mozilla/firefox/abc.default"
+printf '%s\n' "${S}cookie" >"$F/.config/google-chrome/Default/Cookies"
+printf '%s\n' "${S}cookie" >"$F/.mozilla/firefox/abc.default/cookies.sqlite"
+chmod 700 "$F/.config/google-chrome" "$F/.mozilla/firefox"
+mk proj/.env "API_KEY=${S}envfile"
+mk proj/clean.env "FOO=bar"
+mk a/b/c/d/deep.env "API_KEY=${S}toodeep"
+printf 'export GH_TOKEN=%shist1\ncurl --password %shist2 x\nls\n' "$S" "$S" >"$F/.bash_history"
+chmod 600 "$F/.bash_history"
+snap_before=$(find "$F" -printf '%p %m %s %T@\n' | sort | md5sum)
+ab_audit() { env -i HOME="$F" PATH="$PATH" LANG=C FAKE_API_TOKEN="${S}envval" PLAIN_VAR=1 bash "$SRC/bin/aibot" audit "$@"; }
+aj=$(ab_audit --json --lang en); arc=$?
+at=$(ab_audit --lang en)
+az=$(ab_audit --lang zh)
+snap_after=$(find "$F" -printf '%p %m %s %T@\n' | sort | md5sum)
+[ "$arc" = 0 ] && pass "audit --json exit code 0 (findings are not errors)" || fail "audit exit code $arc"
+miss=""
+for c in ssh-key ssh-authorized github-cli git-credentials netrc aws gcloud azure kube docker npm pypi cargo rclone claude codex gemini aibot-secrets browser env-file shell-history env-var; do
+  case "$aj" in *"\"category\":\"$c\""*) ;; *) miss="$miss $c" ;; esac
+done
+[ -z "$miss" ] && pass "audit lists every category" || fail "audit missing categories:$miss"
+case "$aj$at$az" in *SENTINEL_FAKE_*) fail "audit output leaked a fake secret" ;; *) pass "audit output contains no secret content (text, json, zh)" ;; esac
+njson=$(printf '%s\n' "$aj" | grep -c '"category"')
+ntext=$(printf '%s\n' "$at" | grep -c '^- ')
+[ "$njson" = "$ntext" ] && [ "$njson" -ge 22 ] && pass "audit text and json agree ($njson items)" || fail "audit item counts differ (json=$njson text=$ntext)"
+[ "$(printf '%s\n' "$at" | grep -c '⚠')" = 1 ] && printf '%s\n' "$at" | grep '⚠' | grep -q '~/.ssh/id_rsa' && pass "only the 644 file is flagged (text)" || fail "644 flag (text)"
+[ "$(printf '%s\n' "$aj" | grep -c '"exposed":true')" = 1 ] && printf '%s\n' "$aj" | grep '"exposed":true' | grep -q '"path":"~/.ssh/id_rsa"' && pass "only the 644 file is flagged (json)" || fail "644 flag (json)"
+printf '%s\n' "$aj" | grep '"path":"~/.ssh/id_ed25519"' | grep -q 'NOT passphrase' && pass "unencrypted OpenSSH key noted" || fail "unencrypted OpenSSH key noted"
+printf '%s\n' "$aj" | grep '"path":"~/.ssh/id_enc"' | grep -q '"note":"passphrase-protected"' && pass "encrypted PEM key noted" || fail "encrypted PEM key noted"
+printf '%s\n' "$aj" | grep '"path":"~/.pypirc"' | grep -q 'not followed' && pass "symlink leading outside ~ not followed" || fail "symlink outside ~"
+printf '%s\n' "$aj" | grep '"path":"~/.kube/config"' | grep -q 'over 1MB' && pass "over-1MB file listed but not read" || fail "over-1MB note"
+case "$aj" in *deep.env* | *clean.env*) fail "env scan depth/clean filter" ;; *) pass "*.env: only <=3 levels and only key-like files" ;; esac
+case "$aj" in *'"path":"env:FAKE_API_TOKEN"'*) ;; *) fail "env var name listed" ;; esac
+case "$aj" in *PLAIN_VAR*) fail "harmless env var listed" ;; *) pass "env vars: only secret-like names, never values" ;; esac
+case "$az" in *"共 "*) pass "audit zh" ;; *) fail "audit zh" ;; esac
+command -v jq >/dev/null 2>&1 && { printf '%s\n' "$aj" | jq -e '.count == (.items|length)' >/dev/null 2>&1 && pass "audit --json is valid JSON" || fail "audit --json is valid JSON"; }
+[ "$snap_before" = "$snap_after" ] && pass "audit changed nothing (read-only)" || fail "audit modified files"
+CL=$(mktemp -d)
+cj=$(env -i HOME="$CL" PATH="$PATH" LANG=C bash "$SRC/bin/aibot" audit --lang en); crc=$?
+case "$cj" in *"0 item(s)"*) [ "$crc" = 0 ] && pass "clean account: 0 items, exit 0" || fail "clean account exit $crc" ;; *) fail "clean account should have 0 items" ;; esac
+ls -A "$CL" | grep -q . && fail "audit created files in a clean home" || pass "audit created nothing in a clean home"
+rm -rf "$F" "$CL" "/tmp/outside_$LABEL"
+
+# ---- 9d. several bots on one computer: ledger + lock (standalone aibot, own throw-away AIBOT_HOME)
+SH=$(mktemp -d)
+ab() { AIBOT_HOME="$SH/.aibot" bash "$SRC/bin/aibot" "$@"; }
+abq() { AIBOT_HOME="$SH/.aibot" bash "$SRC/bin/aibot" "$@" >/dev/null 2>&1; }
+ab ledger add "first note" --by tester >/dev/null 2>&1
+grep -qE '^[0-9]{4}-[0-9]{2}-[0-9]{2} [0-9]{2}:[0-9]{2} tester first note$' "$SH/.aibot/shared/LEDGER.md" && pass "ledger add: line format" || fail "ledger add: line format"
+AIBOT_BOT_NAME=zed ab ledger add "named by env" >/dev/null 2>&1
+grep -q ' zed named by env$' "$SH/.aibot/shared/LEDGER.md" && pass "ledger: default name from AIBOT_BOT_NAME" || fail "ledger: default name"
+ab ledger add "$(printf 'bad\atext')" --by C >/dev/null 2>&1
+grep -q ' C badtext$' "$SH/.aibot/shared/LEDGER.md" && pass "ledger: control characters stripped" || fail "ledger: control chars"
+n0=$(wc -l <"$SH/.aibot/shared/LEDGER.md")
+abq ledger add "token ghp_abcdefghijklmnop" && fail "ledger accepted ghp_" || pass "ledger refuses ghp_ secret"
+abq ledger add "key sk-abc123" && fail "ledger accepted sk-" || pass "ledger refuses sk- secret"
+abq ledger add "AKIAIOSFODNN7EXAMPLE" && fail "ledger accepted AKIA" || pass "ledger refuses AKIA secret"
+abq ledger add "long ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789abcdef" && fail "ledger accepted 32+ char run" || pass "ledger refuses 32+ char key-like run"
+abq ledger add "$(printf 'one\ntwo')" && fail "ledger accepted 2 lines" || pass "ledger refuses multi-line"
+abq ledger add "$(head -c 600 /dev/zero | tr '\0' 'a' | sed 's/aaaaa/aaa a /g')" && fail "ledger accepted >500 chars" || pass "ledger refuses >500 chars"
+[ "$(wc -l <"$SH/.aibot/shared/LEDGER.md")" = "$n0" ] && ! grep -q 'ghp_\|AKIA' "$SH/.aibot/shared/LEDGER.md" && pass "refused lines were not written" || fail "refused lines written"
+ab ledger tail 2 | grep -q 'badtext' && pass "ledger tail" || fail "ledger tail"
+ab ledger grep ZED | grep -q 'named by env' && pass "ledger grep" || fail "ledger grep"
+: >"$SH/.aibot/shared/LEDGER.md"
+( for i in $(seq 50); do abq ledger add "a$i" --by A; done ) &
+pl1=$!
+( for i in $(seq 50); do abq ledger add "b$i" --by B; done ) &
+pl2=$!
+wait "$pl1" "$pl2"
+L="$SH/.aibot/shared/LEDGER.md"
+[ "$(wc -l <"$L")" = 100 ] && [ "$(grep -cE ' A a[0-9]+$' "$L")" = 50 ] && [ "$(grep -cE ' B b[0-9]+$' "$L")" = 50 ] && [ -z "$(sort "$L" | uniq -d)" ] && pass "ledger: 2 writers x 50 lines = 100 intact lines" || fail "ledger concurrent writes ($(wc -l <"$L") lines)"
+# locks
+rm -f "$SH/order"
+AIBOT_HOME="$SH/.aibot" bash "$SRC/bin/aibot" lock tl -- bash -c "echo s1 >>$SH/order; sleep 3; echo e1 >>$SH/order" &
+pk1=$!
+sleep 1
+lst=$(ab lock list 2>&1)
+case "$lst" in "tl "*) pass "lock list shows the held lock" ;; *) fail "lock list: $lst" ;; esac
+AIBOT_HOME="$SH/.aibot" bash "$SRC/bin/aibot" lock tl -- bash -c "echo s2 >>$SH/order" &
+pk2=$!
+wait "$pk1" "$pk2"
+[ "$(tr '\n' ' ' <"$SH/order")" = "s1 e1 s2 " ] && pass "lock: second process waited for the first" || fail "lock order: $(tr '\n' ' ' <"$SH/order")"
+AIBOT_HOME="$SH/.aibot" bash "$SRC/bin/aibot" lock tw -- sleep 4 &
+pk3=$!
+sleep 1
+t0=$(date +%s)
+wout=$(ab lock tw --wait 1 -- true 2>&1); wrc=$?
+t1=$(date +%s)
+[ "$wrc" = 75 ] && [ $((t1 - t0)) -le 3 ] && pass "lock --wait 1: exit 75 after ~1s" || fail "lock --wait 1: rc=$wrc after $((t1 - t0))s"
+case "$wout" in *"Held by"* | *"拿著"*) pass "lock timeout says who holds it" ;; *) fail "lock timeout message" ;; esac
+wait "$pk3"
+AIBOT_HOME="$SH/.aibot" bash "$SRC/bin/aibot" lock kl -- sleep 8 &
+pk4=$!
+sleep 1
+kill -9 "$pk4"
+wait "$pk4" 2>/dev/null
+ab lock kl --wait 3 -- true >/dev/null 2>&1 && pass "lock frees itself when the holder is kill -9'd" || fail "lock stuck after kill -9"
+ab lock list 2>&1 | grep -q 'kl ' && fail "lock list shows a dead holder" || pass "lock list ignores dead holders"
+ab lock ez -- bash -c 'exit 7' >/dev/null 2>&1
+[ "$?" = 7 ] && pass "lock passes the command's exit code through" || fail "lock exit code passthrough"
+abq lock '../evil' -- true && fail "lock accepted a bad name" || pass "lock refuses a bad name"
+# shared component: folder + reminder block only in OUR rules files, uninstall removes the block
+bash "$SRC/install.sh" --lang en --with rules,shared --yes >/tmp/shared_"$LABEL".out 2>&1
+bash "$SRC/install.sh" --lang en --with rules,shared --yes >>/tmp/shared_"$LABEL".out 2>&1
+ok_if "shared: folders created" test -d "$HOME/.aibot/shared/locks"
+[ "$(grep -c 'aibot-hostkit:shared:begin' "$HOME/work/CLAUDE.md")" = 1 ] && pass "shared: reminder block added once to our rules file" || fail "shared: reminder block in CLAUDE.md"
+mkdir -p "$SH/own" && printf 'my own rules\n' >"$SH/own/CLAUDE.md"
+cp "$SH/own/CLAUDE.md" "$SH/own/CLAUDE.md.orig"
+bash "$SRC/install.sh" --lang en --with shared --work "$SH/own" --yes >>/tmp/shared_"$LABEL".out 2>&1
+cmp -s "$SH/own/CLAUDE.md" "$SH/own/CLAUDE.md.orig" && pass "shared: a rules file that is not ours is never touched" || fail "shared touched a foreign CLAUDE.md"
+bash "$SRC/install.sh" --lang en --with rules,shared --work "$HOME/work" --yes >>/tmp/shared_"$LABEL".out 2>&1
+rm -rf "$SH"
+
 # ---- 10. uninstall
 if [ "$HAS_SUDO" = 1 ] && [ "$CRON" = 1 ]; then crontab -l 2>/dev/null | grep -q aibot-hostkit && pass "crontab has aibot entries before uninstall" || fail "crontab entries before uninstall"; fi
 "$AIBOT" uninstall --yes >/tmp/uninstall_"$LABEL".out 2>&1
@@ -190,6 +339,7 @@ crontab -l 2>/dev/null | grep -q aibot-hostkit && fail "uninstall: crontab clean
 tmux has-session -t aibot 2>/dev/null && fail "uninstall: session removed" || pass "uninstall: session removed"
 ok_if "uninstall keeps user files (~/work)" test -d "$HOME/work"
 ok_if "uninstall keeps Claude Code binary" test -x "$HOME/.local/bin/claude"
+[ "$(grep -c 'aibot-hostkit:shared:begin' "$HOME/work/CLAUDE.md")" = 0 ] && pass "uninstall: shared reminder block removed, file kept" || fail "uninstall: shared block removed"
 
 printf 'DONE [%s] fails=%d elapsed=%ss\n' "$LABEL" "$FAILS" "$(( $(date +%s) - t_start ))"
 exit "$FAILS"

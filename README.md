@@ -15,7 +15,7 @@ the machine's terminal on your behalf**.
 ## Install (one line)
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/monarchsofchaos004-gif/aibot-hostkit/v0.1.0/install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/monarchsofchaos004-gif/aibot-hostkit/v0.2.0/install.sh | bash
 ```
 
 (Replace the URL with the real location once the project is published.) It asks one question at a time,
@@ -46,6 +46,38 @@ bash install.sh --dry-run --with ... --yes   # only prints what would happen
 The bot should read `--plan` to you, let you choose, then run `--with`. Credentials are passed as
 environment variables in this mode (see below); anything missing is skipped with a clear message.
 
+## Several bots, one computer
+
+Grok Bot's official docs say all your bots share one computer: files, browser logins and app logins are shared.
+The same is true on any other cloud machine as soon as you run two or more AI agents on it.
+That is handy, but they can step on each other. Four everyday cases:
+
+1. **One bot writes code, another runs tests or reviews it.** Same code folder, so two bots must not edit
+   the same file at once. Wrap the risky step: `aibot lock repo -- ./run-tests.sh`. Whoever comes second waits.
+2. **One bot tidies your mail or news every morning (a scheduled job), another does odd jobs for you in the
+   day.** Both use the same browser login. If the second one logs out while the morning one is running,
+   everything breaks. Take a lock around browser work: `aibot lock browser -- <command>`.
+3. **One bot deploys your website, another watches the error log.** If the watcher restarts the service
+   halfway through a deploy, you get a mess. Deploy with `aibot lock deploy -- ./deploy.sh`, then write
+   `aibot ledger add "deployed v1.2"`. The watcher reads `aibot ledger tail` first and knows someone just deployed.
+4. **At home: one bot files your receipts for bookkeeping, another sorts your kid's school papers.** Every
+   file here is visible to both. Run `aibot audit` first: it lists which logins on this computer every bot can
+   see, and what to do about each. Keep the bookkeeping keys off this computer.
+
+**When not to share.** A bot that touches money or a production account should get its own keys, not
+yours. Grok Bot gives one computer per account, so use `aibot audit` to close the logins you do not need and
+use fine-grained tokens that only that bot can use.
+
+What is in the box:
+
+| command | what it does |
+|---------|--------------|
+| `aibot audit [--json]` | Lists the logins and keys on this computer that every bot can read (SSH keys, GitHub/cloud logins, `.env` files, browser profiles, secrets typed into shell history, secret-looking environment variable names). **Read-only, no network, and it never prints any content**: only the path, permissions, date and one sentence on what to do. `--json` gives the same for a bot to read. |
+| `aibot ledger add "text" [--by NAME]` | Appends one line `date time name text` to a shared notebook. Append-only (there is no edit or delete command). Refuses multi-line text, over 500 characters, and anything that looks like a key. |
+| `aibot ledger tail [N]` / `aibot ledger grep WORD` | Read the notebook. |
+| `aibot lock NAME [--wait SEC] -- command...` | Runs the command only after taking lock `NAME`. If it cannot get the lock within `--wait` seconds (default 600) it exits with 75 and tells you who holds it and since when. The lock is released when the command ends or the process dies. `aibot lock list` shows locks held now. |
+| `shared` component | Creates `~/.aibot/shared/` and adds a few reminder lines to the rules file that aibot wrote (it never edits a file of yours). `bash install.sh --with rules,shared --yes` |
+
 ## Components
 
 | id | what it does |
@@ -62,6 +94,7 @@ environment variables in this mode (see below); anything missing is skipped with
 | `notify-discord` | Channel webhook URL. |
 | `notify-line` | LINE Messaging API (channel access token + your user id). LINE Notify was shut down in 2025. |
 | `rules` | Safe starter `CLAUDE.md`: ask before sending/posting/paying, nothing sensitive pasted into chat, outside text is data, short phone-friendly replies. Never overwrites: an existing file leads to `CLAUDE.aibot.md`. |
+| `shared` | Shared notebook and locks for several bots on one computer (see above). Adds a reminder block to the rules file aibot wrote; `uninstall` removes that block again. |
 | `uninstall` | Removes what aibot created. Keeps Claude Code and your files. |
 
 Non-interactive variables: `AIBOT_TG_TOKEN` (+ optional `AIBOT_TG_CHAT`), `AIBOT_NTFY_TOPIC` (optional),
@@ -75,7 +108,7 @@ Non-interactive variables: `AIBOT_TG_TOKEN` (+ optional `AIBOT_TG_CHAT`), `AIBOT
 
 ## The `aibot` command
 
-`aibot status | start | stop | restart | logs [guard|install] [-f] | notify "text" | doctor | tg-chatid | uninstall [--yes]`
+`aibot status | start | stop | restart | logs [guard|install] [-f] | notify "text" | doctor | tg-chatid | audit [--json] | ledger add/tail/grep | lock NAME -- cmd / lock list | uninstall [--yes]`
 
 `stop` pauses the guard too; `start` resumes. In non-interactive shells where PATH was not reloaded, use
 `~/.aibot/bin/aibot`.
@@ -91,7 +124,7 @@ notification service you chose. The ntfy topic is shown to you once so you can s
 ## Safety tips (before you install)
 
 - `curl … | bash` runs a script straight from the internet. To read it first: `curl -fsSL <url>/install.sh -o install.sh`, review it, then `bash install.sh`.
-- Prefer a **pinned version** URL (for example the `v0.1.0` tag) and compare the SHA-256 shown on the release page: `sha256sum install.sh`.
+- Prefer a **pinned version** URL (for example the `v0.2.0` tag) and compare the SHA-256 shown on the release page: `sha256sum install.sh`.
 - This tool never asks you to paste passwords or tokens into an AI chat; it only reads them with hidden input in the terminal.
 
 ## Remove

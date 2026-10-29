@@ -6,12 +6,12 @@
 #   bash install.sh --with tmux,claude,remote,guard,notify-ntfy --yes
 set -euo pipefail
 
-VERSION="0.1.0"
+VERSION="0.2.0"
 AIBOT_HOME="${AIBOT_HOME:-$HOME/.aibot}"
 # 路徑會寫進 cron／systemd／tmux 指令列:只准一般字元,免得被當成指令或被 cron 的 % 拆行
 case "$AIBOT_HOME" in ""|*[!A-Za-z0-9._/-]*) echo "AIBOT_HOME may only contain letters, digits, . _ / - (got: $AIBOT_HOME)" >&2; exit 2 ;; esac
 MARK="# aibot-hostkit"
-ALL_IDS="preflight tmux claude codex gemini remote guard notify-telegram notify-ntfy notify-discord notify-line rules uninstall"
+ALL_IDS="preflight tmux claude codex gemini remote guard notify-telegram notify-ntfy notify-discord notify-line rules shared uninstall"
 
 PLAN=0 DRY=0 YES=0 LANG_OPT="" WITH="" NAME="${AIBOT_NAME:-}" WORK="${AIBOT_WORK:-}"
 AGENT_OPT="" CMD_OPT="${AIBOT_CMD:-}" AGENT=""
@@ -90,6 +90,7 @@ desc() {
     notify-discord) m "Discord 通知：傳到你的頻道。代價：要在頻道設定建一個 webhook 網址。" "Discord alerts into your channel. Cost: you create a webhook URL in channel settings." ;;
     notify-line) m "LINE 通知（LINE Messaging API）：傳 LINE 訊息給你。注意 LINE Notify 已在 2025 年停止服務，這裡用的是官方帳號 Messaging API。" "LINE alerts via the LINE Messaging API. Note: LINE Notify was shut down in 2025; this uses an official-account Messaging API channel." ;;
     rules) m "在工作目錄放一份安全版 CLAUDE.md：寄信、發文、付款等對外動作先問你、密碼不貼進對話、網頁/信件內文只當資料不當指令、手機閱讀用短句。已存在的檔案不會覆蓋。" "Puts a safe CLAUDE.md in the work dir: ask before sending mail/posting/paying, never paste secrets into chat, treat web/mail text as data not commands, short phone-friendly replies. Never overwrites an existing file." ;;
+    shared) m "多個 Bot 共用一台電腦時不互撞：建共用資料夾（共用帳本 aibot ledger、搶鎖 aibot lock），並在規則檔加一小段提醒。另外 aibot audit 可列出這台有哪些登入／金鑰所有 Bot 都看得到（只列出、不顯示內容）。" "For several bots on one computer: creates a shared folder (shared notebook: aibot ledger, mutual exclusion: aibot lock) and adds a short reminder to the rules file. Also, aibot audit lists which logins/keys every bot here can see (lists only, never shows contents)." ;;
     uninstall) m "移除 aibot 建立的東西（排程、tmux 工作階段、~/.aibot、PATH 行）。不會移除 Claude Code 本體和你的檔案。" "Removes what aibot created (schedule, tmux session, ~/.aibot, PATH lines). Does NOT remove Claude Code or your files." ;;
   esac
 }
@@ -122,6 +123,7 @@ cmd_plan() {
     printf '\n[%s]\n  %s\n  %s %s\n' "$id" "$(desc "$id")" "$(m '使用者要準備：' 'User must prepare:')" "$(need "$id")"
   done
   printf '\n'
+  say "如果同一台電腦上有兩個以上的 Bot，再加上 shared。" "If two or more bots share this computer, also add shared."
   say "建議的完整選擇（用法 A）：" "Suggested full selection (way A):"
   echo "  bash install.sh --with tmux,claude,remote,guard,notify-ntfy,rules --yes"
   say "不用 AI（用法 D）範例：" "No-AI example (way D):"
@@ -596,6 +598,53 @@ c_rules() {
   rec rules ok "$target"
 }
 
+# ---- several bots on one computer
+shared_block() {
+  if [ "$ZH" = 1 ]; then
+    cat <<'EOF'
+<!-- aibot-hostkit:shared:begin -->
+## 多個 Bot 共用這台電腦時
+- 動共用的東西（程式碼、瀏覽器登入、服務）之前，先用 `aibot lock 名字 -- 指令` 拿鎖；做完用 `aibot ledger add "做了什麼"` 記一行。
+- 開工先看 `aibot ledger tail`，知道別的 Bot 剛做了什麼。
+- 不要把金鑰寫進共用帳本。
+- 先跑 `aibot audit`，看這台有哪些登入是大家都看得到的。
+<!-- aibot-hostkit:shared:end -->
+EOF
+  else
+    cat <<'EOF'
+<!-- aibot-hostkit:shared:begin -->
+## When several bots share this computer
+- Before touching something shared (code, a browser login, a service), take a lock: `aibot lock NAME -- command`. When done, leave one line: `aibot ledger add "what you did"`.
+- Start by reading `aibot ledger tail` to see what the other bots just did.
+- Never write secrets into the shared ledger.
+- Run `aibot audit` to see which logins on this computer every bot can see.
+<!-- aibot-hostkit:shared:end -->
+EOF
+  fi
+}
+
+c_shared() {
+  local work="${WORK:-$(conf_get AIBOT_WORK)}" f first done_any=0
+  work="${work:-$HOME/work}"
+  if [ "$DRY" = 1 ]; then DRYP "create $AIBOT_HOME/shared/locks, LEDGER.md; add a 'several bots' block to our rules file in $work"; rec shared dry-run ""; return; fi
+  (umask 077; mkdir -p "$AIBOT_HOME/shared/locks"; touch "$AIBOT_HOME/shared/LEDGER.md")
+  have flock || warn "找不到 flock（util-linux），aibot lock／ledger 會無法使用" "flock (util-linux) not found; aibot lock / ledger will not work"
+  # only touch a rules file that aibot itself wrote (its first line names aibot-hostkit), never a file of yours
+  for f in "$work/CLAUDE.md" "$work/CLAUDE.aibot.md"; do
+    [ -f "$f" ] && [ ! -L "$f" ] || continue
+    first=$(head -n 1 -- "$f" 2>/dev/null || true)
+    case "$first" in *aibot-hostkit*) ;; *) continue ;; esac
+    grep -qF 'aibot-hostkit:shared:begin' "$f" 2>/dev/null && { done_any=1; continue; }
+    { printf '\n'; shared_block; } >>"$f"
+    say "已在 $f 加上共用提醒" "Added the shared-use reminder to $f"
+    done_any=1
+  done
+  if [ "$done_any" = 0 ]; then
+    note_next "$(m "沒找到 aibot 的規則檔，所以沒有加共用提醒；想要的話一起選 rules，或把 $AIBOT_HOME/bin/aibot 的用法（aibot lock／ledger／audit）自己寫進給 Bot 的規則。" "No aibot rules file found, so the shared-use reminder was not added. Select rules too, or write the aibot lock / ledger / audit usage into your bots' rules yourself.")"
+  fi
+  rec shared ok "$AIBOT_HOME/shared"
+}
+
 c_uninstall() {
   local a=()
   [ "$YES" = 1 ] && a=(--yes)
@@ -614,7 +663,7 @@ normalize_with() { # expand/validate --with list into SELECTED (execution order)
     if [ "$w" = all ]; then want="$ALL_IDS"; break; fi
     valid_id "$w" || die "不認得的元件: $w（用 --plan 看清單）" "unknown component: $w (see --plan)"
   done
-  for id in preflight tmux claude codex gemini rules notify-telegram notify-ntfy notify-discord notify-line remote guard uninstall; do
+  for id in preflight tmux claude codex gemini rules shared notify-telegram notify-ntfy notify-discord notify-line remote guard uninstall; do
     case " $want " in *" $id "*) out="${out:+$out,}$id" ;; esac
   done
   SELECTED="$out"
@@ -623,9 +672,9 @@ normalize_with() { # expand/validate --with list into SELECTED (execution order)
 interactive_select() {
   local id out="" def
   say "我會一項一項介紹，你決定要不要裝。隨時 Ctrl+C 可離開。" "I will describe each option; you decide. Press Ctrl+C anytime to quit."
-  for id in tmux claude codex gemini remote guard notify-ntfy notify-telegram notify-discord notify-line rules; do
+  for id in tmux claude codex gemini remote guard notify-ntfy notify-telegram notify-discord notify-line rules shared; do
     printf '\n[%s]\n  %s\n  %s %s\n' "$id" "$(desc "$id")" "$(m '你要準備：' 'You need:')" "$(need "$id")"
-    case "$id" in tmux | claude | remote | guard | notify-ntfy | rules) def=y ;; *) def=n ;; esac
+    case "$id" in tmux | claude | remote | guard | notify-ntfy | rules | shared) def=y ;; *) def=n ;; esac
     if [ "$id" = claude ]; then say "（Claude / Codex / Gemini 三選一或多選；一個都不用也可以，之後會問你要常駐什麼指令）" "(Claude / Codex / Gemini: pick any; none is fine too - you will then be asked for a command to keep alive)"; fi
     if ask_yn "要裝 $id 嗎？" "Install $id?" "$def"; then out="${out:+$out,}$id"; fi
   done
@@ -644,6 +693,7 @@ run_selected() {
       codex) c_codex ;;
       gemini) c_gemini ;;
       rules) c_rules ;;
+      shared) c_shared ;;
       notify-telegram) c_notify_telegram ;;
       notify-ntfy) c_notify_ntfy ;;
       notify-discord) c_notify_discord ;;
@@ -676,7 +726,7 @@ write_aibot_bin() {
 # aibot - control tool installed by aibot-hostkit (MIT). Zero telemetry.
 set -uo pipefail
 
-AIBOT_VERSION="0.1.0"
+AIBOT_VERSION="0.2.0"
 AIBOT_HOME="${AIBOT_HOME:-$HOME/.aibot}"
 # 路徑會寫進 cron／systemd／tmux 指令列:只准一般字元,免得被當成指令或被 cron 的 % 拆行
 case "$AIBOT_HOME" in ""|*[!A-Za-z0-9._/-]*) echo "AIBOT_HOME may only contain letters, digits, . _ / - (got: $AIBOT_HOME)" >&2; exit 2 ;; esac
@@ -699,9 +749,12 @@ load() {
   AIBOT_TG_TOKEN="" AIBOT_TG_CHAT="" AIBOT_NTFY_TOPIC="" AIBOT_DISCORD_WEBHOOK="" AIBOT_LINE_TOKEN="" AIBOT_LINE_USER=""
   # shellcheck source=/dev/null
   [ -f "$AIBOT_HOME/config.env" ] && . "$AIBOT_HOME/config.env"
-  # shellcheck source=/dev/null
-  [ -f "$AIBOT_HOME/secrets.env" ] && . "$AIBOT_HOME/secrets.env"
-  mkdir -p "$AIBOT_HOME/logs" "$AIBOT_HOME/state"
+  # audit is strictly read-only: it neither loads the secrets file nor creates folders
+  if [ "${AUD_RO:-0}" != 1 ]; then
+    # shellcheck source=/dev/null
+    [ -f "$AIBOT_HOME/secrets.env" ] && . "$AIBOT_HOME/secrets.env"
+    mkdir -p "$AIBOT_HOME/logs" "$AIBOT_HOME/state"
+  fi
   return 0
 }
 
@@ -1015,6 +1068,16 @@ strip_mark() { # strip_mark file : delete our marked lines, keep mode/owner
   rm -f "$tmp"
 }
 
+# strip_shared_block file : remove the "several bots" block aibot added (between its two marker lines); keeps mode/owner
+strip_shared_block() {
+  local f="$1" tmp
+  [ -f "$f" ] && [ ! -L "$f" ] || return 0
+  grep -qF 'aibot-hostkit:shared:begin' "$f" 2>/dev/null && grep -qF 'aibot-hostkit:shared:end' "$f" 2>/dev/null || return 0
+  tmp=$(mktemp)
+  awk '/aibot-hostkit:shared:begin/{skip=1} !skip{print} /aibot-hostkit:shared:end/{skip=0}' "$f" >"$tmp" && cat "$tmp" >"$f"
+  rm -f "$tmp"
+}
+
 cmd_uninstall() {
   local yes=0 a
   for a in "$@"; do
@@ -1025,6 +1088,7 @@ cmd_uninstall() {
   say "  - tmux 工作階段 $AIBOT_SESSION" "  - tmux session $AIBOT_SESSION"
   say "  - 資料夾 $AIBOT_HOME（設定、秘密、紀錄）" "  - folder $AIBOT_HOME (config, secrets, logs)"
   say "  - ~/.bashrc 與 ~/.profile 裡標記 aibot-hostkit 的 PATH 行" "  - the aibot-hostkit PATH lines in ~/.bashrc and ~/.profile"
+  say "  - 規則檔裡 aibot 加的「多個 Bot 共用」段落（共用帳本與鎖在 $AIBOT_HOME/shared，會跟著資料夾一起刪）" "  - the 'several bots' block aibot added to the rules file (shared ledger and locks live in $AIBOT_HOME/shared and go with the folder)"
   say "不會移除: Claude Code 本體、tmux 套件、$AIBOT_WORK 裡你的檔案（含 CLAUDE.md）" "NOT removed: Claude Code itself, the tmux package, your files in $AIBOT_WORK (incl. CLAUDE.md)"
   if [ "$yes" -ne 1 ]; then
     confirm_tty "$(m '確定移除？' 'Remove now?')" || { say "已取消（非互動請加 --yes）" "cancelled (use --yes when non-interactive)"; return 1; }
@@ -1040,11 +1104,412 @@ cmd_uninstall() {
   tmux kill-session -t "$AIBOT_SESSION" 2>/dev/null || true
   strip_mark "$HOME/.bashrc"
   strip_mark "$HOME/.profile"
+  strip_shared_block "$AIBOT_WORK/CLAUDE.md"
+  strip_shared_block "$AIBOT_WORK/CLAUDE.aibot.md"
   # 只刪 aibot 自己建的資料夾:路徑是空的、/、家目錄,或裡面沒有安裝標記 → 拒刪(防 AIBOT_HOME 被設錯把整個家目錄刪掉)
   case "${AIBOT_HOME%/}" in ""|"/"|"${HOME%/}") say "拒絕刪除：$AIBOT_HOME 不是 aibot 的資料夾" "Refusing to delete $AIBOT_HOME: not an aibot folder"; return 1 ;; esac
   if [ ! -f "$AIBOT_HOME/.aibot-hostkit" ]; then say "拒絕刪除：$AIBOT_HOME 沒有 aibot 安裝標記" "Refusing to delete $AIBOT_HOME: no aibot install marker"; return 1; fi
   rm -rf "$AIBOT_HOME"
   say "已移除。" "Removed."
+}
+
+# ---------- audit: which logins/keys can every bot on this computer see? ----------
+# Read-only. Never prints file contents: matching is done with grep -c (numbers only).
+A_CAT=() A_PATH=() A_PERM=() A_EXP=() A_DATE=() A_NOTE=() A_ADV=()
+HOME_REAL=""
+AUD_REAL="" AUD_OUT=0 AUD_LABEL="" AUD_ADV=""
+AUD_KEYRE='^[[:space:]]*(export[[:space:]]+)?[A-Za-z0-9_]*(TOKEN|KEY|SECRET|PASSWORD|PASSWD|PASS|AUTH|CREDENTIAL|COOKIE|SESSION)[A-Za-z0-9_]*[[:space:]]*=[[:space:]]*[^[:space:]#]'
+AUD_HISTRE='([A-Za-z0-9_]*(TOKEN|KEY|SECRET|PASSWORD|PASSWD)[A-Za-z0-9_]*=[^[:space:]=])|(--(password|passwd|token|secret|api-key|apikey)[= ][^[:space:]])|([Aa]uthorization:[[:space:]]*([Bb]earer|[Bb]asic)[[:space:]]+[^[:space:]])'
+
+aud_info() { # aud_info category -> AUD_LABEL AUD_ADV
+  case "$1" in
+    ssh-key) AUD_LABEL=$(m 'SSH 私鑰' 'SSH private key'); AUD_ADV=$(m '加密碼（ssh-keygen -p）；用不到的移出這台電腦' 'add a passphrase (ssh-keygen -p); move keys nobody needs off this computer') ;;
+    ssh-authorized) AUD_LABEL=$(m 'SSH 允許登入的公鑰' 'SSH authorized_keys'); AUD_ADV=$(m '確認每一行都是你認得的裝置，其餘刪掉' 'check every line is a device you know; delete the rest') ;;
+    github-cli) AUD_LABEL=$(m 'GitHub 登入 (gh)' 'GitHub CLI login'); AUD_ADV=$(m '不用就 gh auth logout；或改用只給這個 Bot 的細權限 token' 'gh auth logout if unused, or use a fine-grained token just for this bot') ;;
+    git-credentials) AUD_LABEL=$(m 'Git 帳密檔' 'Git credentials file'); AUD_ADV=$(m '改用只給這個 Bot 的細權限 token' 'use a fine-grained token just for this bot') ;;
+    netrc) AUD_LABEL=$(m '.netrc 帳密' '.netrc logins'); AUD_ADV=$(m '用不到的帳密刪掉' 'delete logins you do not need') ;;
+    aws) AUD_LABEL=$(m 'AWS 金鑰' 'AWS keys'); AUD_ADV=$(m '改用權限最小的 IAM 帳號或短期憑證' 'use a least-privilege IAM user or short-lived credentials') ;;
+    gcloud) AUD_LABEL=$(m 'Google Cloud 登入' 'Google Cloud login'); AUD_ADV=$(m '不用就 gcloud auth revoke；或改用權限最小的服務帳號' 'gcloud auth revoke if unused, or use a least-privilege service account') ;;
+    azure) AUD_LABEL=$(m 'Azure 登入' 'Azure login'); AUD_ADV=$(m '不用就 az logout' 'az logout if unused') ;;
+    kube) AUD_LABEL=$(m 'Kubernetes 設定' 'Kubernetes config'); AUD_ADV=$(m '只留需要的叢集' 'keep only the clusters you need') ;;
+    docker) AUD_LABEL=$(m 'Docker 登入' 'Docker registry login'); AUD_ADV=$(m '不用就 docker logout' 'docker logout if unused') ;;
+    npm) AUD_LABEL=$(m 'npm token' 'npm token'); AUD_ADV=$(m '改用唯讀或細權限 token' 'use a read-only or fine-grained token') ;;
+    pypi) AUD_LABEL=$(m 'PyPI 帳密' 'PyPI credentials'); AUD_ADV=$(m '改用只給單一專案的 API token' 'use an API token scoped to one project') ;;
+    cargo) AUD_LABEL=$(m 'Cargo (crates.io) token' 'Cargo (crates.io) token'); AUD_ADV=$(m '不用就 cargo logout' 'cargo logout if unused') ;;
+    rclone) AUD_LABEL=$(m 'rclone 雲端設定' 'rclone remotes'); AUD_ADV=$(m '只留需要的雲端' 'keep only the remotes you need') ;;
+    claude) AUD_LABEL=$(m 'Claude 登入' 'Claude login'); AUD_ADV=$(m '這台的每個 Bot 都能用你的 Claude 登入；不想共用就分開主機' 'every bot here can use your Claude login; use a separate computer if that is not OK') ;;
+    codex) AUD_LABEL=$(m 'Codex 登入' 'Codex login'); AUD_ADV=$(m '這台的每個 Bot 都能用你的 ChatGPT 登入；不想共用就分開主機' 'every bot here can use your ChatGPT login; use a separate computer if that is not OK') ;;
+    gemini) AUD_LABEL=$(m 'Gemini 登入' 'Gemini login'); AUD_ADV=$(m '這台的每個 Bot 都能用你的 Google 登入；不想共用就分開主機' 'every bot here can use your Google login; use a separate computer if that is not OK') ;;
+    aibot-secrets) AUD_LABEL=$(m 'aibot 通知金鑰' 'aibot notification keys'); AUD_ADV=$(m '保持 600；通知金鑰只放這一份' 'keep it 600 and keep notification keys only here') ;;
+    browser) AUD_LABEL=$(m '瀏覽器登入' 'Browser logins'); AUD_ADV=$(m '裡面登入中的網站每個 Bot 都能用；不必要的先登出' 'every bot can use the sites logged in there; log out of what is not needed') ;;
+    env-file) AUD_LABEL=$(m '.env 檔' '.env file'); AUD_ADV=$(m '金鑰改放只有需要的程式讀得到的地方' 'move secrets where only the program that needs them can read') ;;
+    shell-history) AUD_LABEL=$(m '指令歷史紀錄' 'Shell history'); AUD_ADV=$(m '從歷史紀錄刪掉那幾行，以後別把金鑰打在指令裡' 'delete those lines from the history file; keep secrets out of commands') ;;
+    env-var) AUD_LABEL=$(m '環境變數' 'Environment variable'); AUD_ADV=$(m '別放在全域環境變數，只交給需要的程式' 'do not keep it in the global environment; pass it only to the program that needs it') ;;
+    *) AUD_LABEL="$1"; AUD_ADV="" ;;
+  esac
+}
+
+aud_disp() { # path with $HOME shown as ~
+  case "$1" in
+    "$HOME") printf '~' ;;
+    "$HOME"/*) printf '~%s' "${1#"$HOME"}" ;;
+    *) printf '%s' "$1" ;;
+  esac
+}
+
+# aud_resolve path : sets AUD_REAL (path to read) / AUD_OUT=1 (symlink leading outside $HOME, never followed)
+aud_resolve() {
+  local r
+  AUD_REAL="" AUD_OUT=0
+  if [ -L "$1" ]; then
+    r=$(readlink -f -- "$1" 2>/dev/null) || r=""
+    case "$r" in
+      "$HOME"/* | "$HOME_REAL"/*) [ -e "$r" ] || return 1; AUD_REAL="$r" ;;
+      *) AUD_OUT=1 ;;
+    esac
+    return 0
+  fi
+  [ -e "$1" ] || return 1
+  AUD_REAL="$1"
+}
+
+aud_small() { [ "$(stat -c %s -- "$AUD_REAL" 2>/dev/null || echo 99999999)" -le 1048576 ]; }
+
+# aud_n regex [-i] : number of matching lines (numbers only, never the lines); -1 = not readable / over 1MB
+aud_n() {
+  local n
+  if [ "$AUD_OUT" = 0 ] && [ -f "$AUD_REAL" ] && aud_small; then
+    n=$(grep -aEc ${2:+"$2"} -- "$1" "$AUD_REAL" 2>/dev/null)
+    echo "${n:-0}"
+  else
+    echo -1
+  fi
+}
+
+# aud_item category path [r|w] [note] [advice] : record one finding (uses AUD_REAL/AUD_OUT)
+aud_item() {
+  local c="$1" f="$2" mode="${3:-r}" note="${4:-}" adv="${5:-}" perm="-" exp=0 dt="" sz
+  aud_info "$c"
+  [ -n "$adv" ] || adv="$AUD_ADV"
+  if [ "$AUD_OUT" = 1 ]; then
+    note=$(m 'symlink 指到家目錄外面，沒有跟進去看' 'symlink points outside ~, not followed')
+  else
+    perm=$(stat -c %a -- "$AUD_REAL" 2>/dev/null || echo "?")
+    dt=$(date -r "$AUD_REAL" +%F 2>/dev/null || true)
+    if [[ "$perm" =~ ^[0-7]+$ ]]; then
+      if [ "$mode" = w ]; then
+        (( (8#$perm & 8#022) != 0 )) && exp=1
+      else
+        (( (8#$perm & 8#044) != 0 )) && exp=1
+      fi
+    fi
+    if [ -f "$AUD_REAL" ]; then
+      sz=$(stat -c %s -- "$AUD_REAL" 2>/dev/null || echo 0)
+      if [ "$sz" -gt 1048576 ]; then note="${note:+$note; }$(m '超過 1MB，沒讀內容' 'over 1MB, content not read')"; fi
+    fi
+  fi
+  if [ "$exp" = 1 ]; then adv="$(m 'chmod 600；' 'chmod 600; ')$adv"; fi
+  A_CAT+=("$c"); A_PATH+=("$(aud_disp "$f")"); A_PERM+=("$perm"); A_EXP+=("$exp")
+  A_DATE+=("$dt"); A_NOTE+=("$note"); A_ADV+=("$adv")
+}
+
+aud_plain() { # aud_plain category path [mode] [note] [advice] : list the file if it exists
+  aud_resolve "$2" || return 0
+  if [ "$AUD_OUT" = 0 ] && [ ! -f "$AUD_REAL" ]; then return 0; fi
+  aud_item "$@"
+}
+
+aud_ssh_key() {
+  local f="$1" n note
+  aud_resolve "$f" || return 0
+  if [ "$AUD_OUT" = 1 ]; then aud_item ssh-key "$f" r; return 0; fi
+  [ -f "$AUD_REAL" ] || return 0
+  if ! aud_small; then aud_item ssh-key "$f" r; return 0; fi
+  n=$(head -n 3 -- "$AUD_REAL" 2>/dev/null | grep -ac 'PRIVATE KEY')
+  [ "${n:-0}" -gt 0 ] || return 0
+  if head -n 3 -- "$AUD_REAL" 2>/dev/null | grep -aq 'ENCRYPTED'; then
+    note=$(m '有密碼保護' 'passphrase-protected')
+  elif head -n 1 -- "$AUD_REAL" 2>/dev/null | grep -aq 'BEGIN OPENSSH PRIVATE KEY'; then
+    # new OpenSSH format: the cipher name sits in the first bytes; "none" = no passphrase
+    if sed -n '2,3p' -- "$AUD_REAL" 2>/dev/null | tr -d '\n' | base64 -d 2>/dev/null | head -c 40 | grep -aq none; then
+      note=$(m '沒有密碼保護' 'NOT passphrase-protected')
+    else
+      note=$(m '有密碼保護' 'passphrase-protected')
+    fi
+  else
+    note=$(m '沒有密碼保護' 'NOT passphrase-protected')
+  fi
+  aud_item ssh-key "$f" r "$note"
+}
+
+aud_scan() {
+  local f n d base cnt name up
+  HOME_REAL=$(readlink -f -- "$HOME" 2>/dev/null || echo "$HOME")
+  for f in "$HOME"/.ssh/id_*; do
+    [ -e "$f" ] || [ -L "$f" ] || continue
+    case "$f" in *.pub) continue ;; esac
+    aud_ssh_key "$f"
+  done
+  f="$HOME/.ssh/authorized_keys"
+  if aud_resolve "$f" && { [ "$AUD_OUT" = 1 ] || [ -f "$AUD_REAL" ]; }; then
+    n=$(aud_n '^[[:space:]]*[^#[:space:]]')
+    if [ "$n" -ge 0 ]; then aud_item ssh-authorized "$f" w "$(m "$n 把公鑰" "$n key(s)")"; else aud_item ssh-authorized "$f" w; fi
+  fi
+  f="$HOME/.config/gh/hosts.yml"
+  if aud_resolve "$f" && { [ "$AUD_OUT" = 1 ] || [ -f "$AUD_REAL" ]; }; then
+    n=$(aud_n 'oauth_token')
+    if [ "$n" -gt 0 ]; then aud_item github-cli "$f" r "$(m 'token 存在檔案裡' 'token stored in the file')"; else aud_item github-cli "$f" r; fi
+  fi
+  f="$HOME/.git-credentials"
+  if aud_resolve "$f" && { [ "$AUD_OUT" = 1 ] || [ -f "$AUD_REAL" ]; }; then
+    n=$(aud_n '[^[:space:]]')
+    if [ "$n" -ge 0 ]; then aud_item git-credentials "$f" r "$(m "$n 組帳密" "$n login(s)")"; else aud_item git-credentials "$f" r; fi
+  fi
+  aud_plain netrc "$HOME/.netrc"
+  aud_plain aws "$HOME/.aws/credentials"
+  for f in application_default_credentials.json credentials.db access_tokens.db; do aud_plain gcloud "$HOME/.config/gcloud/$f"; done
+  for f in msal_token_cache.json msal_token_cache.bin accessTokens.json service_principal_entries.json; do aud_plain azure "$HOME/.azure/$f"; done
+  aud_plain kube "$HOME/.kube/config"
+  f="$HOME/.docker/config.json"
+  if aud_resolve "$f" && { [ "$AUD_OUT" = 1 ] || [ -f "$AUD_REAL" ]; }; then
+    n=$(aud_n '"auth"[[:space:]]*:')
+    if [ "$AUD_OUT" = 1 ] || [ "$n" -ne 0 ]; then aud_item docker "$f" r; fi
+  fi
+  f="$HOME/.npmrc"
+  if aud_resolve "$f" && { [ "$AUD_OUT" = 1 ] || [ -f "$AUD_REAL" ]; }; then
+    n=$(aud_n '_authToken|_auth[[:space:]]*=|_password')
+    if [ "$AUD_OUT" = 1 ] || [ "$n" -ne 0 ]; then aud_item npm "$f" r; fi
+  fi
+  aud_plain pypi "$HOME/.pypirc"
+  aud_plain cargo "$HOME/.cargo/credentials"
+  aud_plain cargo "$HOME/.cargo/credentials.toml"
+  aud_plain rclone "$HOME/.config/rclone/rclone.conf"
+  aud_plain claude "$HOME/.claude/.credentials.json"
+  aud_plain codex "$HOME/.codex/auth.json"
+  for f in "$HOME"/.gemini/*oauth*; do
+    [ -e "$f" ] || [ -L "$f" ] || continue
+    aud_plain gemini "$f"
+  done
+  aud_plain aibot-secrets "$AIBOT_HOME/secrets.env"
+  # browser profiles: only count the profile folders, never open anything inside
+  for base in "$HOME/.config/google-chrome" "$HOME/.config/chromium"; do
+    aud_resolve "$base" || continue
+    if [ "$AUD_OUT" = 1 ]; then aud_item browser "$base"; continue; fi
+    [ -d "$AUD_REAL" ] || continue
+    cnt=0
+    for d in "$AUD_REAL/Default" "$AUD_REAL"/Profile\ *; do [ -d "$d" ] && cnt=$((cnt + 1)); done
+    if [ "$cnt" -gt 0 ]; then aud_item browser "$base" r "$(m "$cnt 個設定檔（可能有登入中的網站）" "$cnt profile(s) (may hold logged-in sites)")"; fi
+  done
+  base="$HOME/.mozilla/firefox"
+  if aud_resolve "$base"; then
+    if [ "$AUD_OUT" = 1 ]; then
+      aud_item browser "$base"
+    elif [ -d "$AUD_REAL" ]; then
+      cnt=0
+      for d in "$AUD_REAL"/*/; do
+        if [ -e "${d}cookies.sqlite" ] || [ -e "${d}logins.json" ]; then cnt=$((cnt + 1)); fi
+      done
+      if [ "$cnt" -gt 0 ]; then aud_item browser "$base" r "$(m "$cnt 個設定檔（可能有登入中的網站）" "$cnt profile(s) (may hold logged-in sites)")"; fi
+    fi
+  fi
+  # *.env files up to 3 levels below $HOME: only those with key-like lines
+  while IFS= read -r -d '' f; do
+    [ "$f" = "$AIBOT_HOME/secrets.env" ] && continue
+    aud_resolve "$f" || continue
+    n=$(aud_n "$AUD_KEYRE" -i)
+    if [ "$n" -gt 0 ]; then aud_item env-file "$f" r "$(m "$n 行看起來像金鑰的 KEY=" "$n key-like KEY= line(s)")"; fi
+  done < <(find "$HOME" -maxdepth 3 \( -name node_modules -o -name .cache -o -name .git -o -name .npm \) -prune -o -type f -name '*.env' -print0 2>/dev/null)
+  # shell history: count suspicious lines (last 1MB at most), never show them
+  for f in "$HOME/.bash_history" "$HOME/.zsh_history"; do
+    aud_resolve "$f" || continue
+    if [ "$AUD_OUT" = 1 ]; then aud_item shell-history "$f"; continue; fi
+    [ -f "$AUD_REAL" ] || continue
+    n=$(tail -c 1048576 -- "$AUD_REAL" 2>/dev/null | grep -aEc -- "$AUD_HISTRE")
+    if [ "${n:-0}" -gt 0 ]; then aud_item shell-history "$f" r "$(m "$n 行疑似把金鑰打在指令裡" "$n line(s) that look like secrets typed into commands")"; fi
+  done
+  # environment variables of this shell: names only
+  aud_info env-var
+  while IFS= read -r name; do
+    up="${name^^}"
+    case "$up" in *TOKEN* | *KEY* | *SECRET* | *PASSWORD* | *PASS* | *AUTH* | *COOKIE* | *SESSION* | *CREDENTIAL*) ;; *) continue ;; esac
+    [ -n "${!name:-}" ] || continue
+    A_CAT+=(env-var); A_PATH+=("env:$name"); A_PERM+=("-"); A_EXP+=(0); A_DATE+=("")
+    A_NOTE+=("$(m '只列名字，不顯示內容' 'name only, value not shown')"); A_ADV+=("$AUD_ADV")
+  done < <(compgen -e)
+  return 0
+}
+
+aud_jesc() { # JSON string body
+  local s="${1//[[:cntrl:]]/ }"
+  s="${s//\\/\\\\}"
+  s="${s//\"/\\\"}"
+  printf '%s' "$s"
+}
+
+cmd_audit() {
+  local json=0 lang="" i sep="" line total
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --json) json=1 ;;
+      --lang) [ $# -ge 2 ] || { echo "--lang needs zh or en" >&2; return 2; }; lang="$2"; shift ;;
+      *) say "用法: aibot audit [--json] [--lang zh|en]" "usage: aibot audit [--json] [--lang zh|en]"; return 2 ;;
+    esac
+    shift
+  done
+  case "$lang" in
+    zh | en) AIBOT_LANG="$lang" ;;
+    "") case "${LC_ALL:-${LC_MESSAGES:-${LANG:-}}}" in zh_TW* | zh_Hant* | zh_HK*) AIBOT_LANG=zh ;; esac ;;
+    *) echo "--lang needs zh or en" >&2; return 2 ;;
+  esac
+  aud_scan
+  total=${#A_CAT[@]}
+  total=$(m "共 $total 項；這台電腦上的每一個 Bot 都讀得到這些" "$total item(s) in total; every bot on this computer can read all of these")
+  if [ "$json" = 1 ]; then
+    printf '{"tool":"aibot-audit","read_only":true,"count":%d,"summary":"%s","items":[\n' "${#A_CAT[@]}" "$(aud_jesc "$total")"
+    for i in "${!A_CAT[@]}"; do
+      printf '%s{"category":"%s","path":"%s","perm":%s,"exposed":%s,"modified":"%s","note":"%s","advice":"%s"}' "$sep" \
+        "$(aud_jesc "${A_CAT[$i]}")" "$(aud_jesc "${A_PATH[$i]}")" \
+        "$([ "${A_PERM[$i]}" = "-" ] && echo null || echo "\"${A_PERM[$i]}\"")" \
+        "$([ "${A_EXP[$i]}" = 1 ] && echo true || echo false)" "$(aud_jesc "${A_DATE[$i]}")" \
+        "$(aud_jesc "${A_NOTE[$i]}")" "$(aud_jesc "${A_ADV[$i]}")"
+      sep=$',\n'
+    done
+    printf '\n]}\n'
+    return 0
+  fi
+  say "aibot audit（只讀；只列出，不顯示任何內容）" "aibot audit (read-only; lists only, never shows contents)"
+  for i in "${!A_CAT[@]}"; do
+    aud_info "${A_CAT[$i]}"
+    line="- $AUD_LABEL  ${A_PATH[$i]}"
+    if [ "${A_PERM[$i]}" != "-" ]; then line="$line | ${A_PERM[$i]}$([ "${A_EXP[$i]}" = 1 ] && printf ' ⚠')"; fi
+    [ -z "${A_DATE[$i]}" ] || line="$line | ${A_DATE[$i]}"
+    [ -z "${A_NOTE[$i]}" ] || line="$line | ${A_NOTE[$i]}"
+    printf '%s | %s\n' "$line" "${A_ADV[$i]}"
+  done
+  printf '%s\n' "$total"
+  return 0
+}
+
+# ---------- shared: ledger + locks for several bots on one computer ----------
+SHARED_DIR=""
+shared_init() {
+  SHARED_DIR="$AIBOT_HOME/shared"
+  have flock || { say "需要 flock（util-linux）" "flock (util-linux) is required"; return 1; }
+  (umask 077; mkdir -p "$SHARED_DIR/locks")
+}
+bot_name() {
+  local n="${AIBOT_BOT_NAME:-}"
+  [ -n "$n" ] || n="$(id -un 2>/dev/null || echo bot)@$(hostname -s 2>/dev/null || uname -n 2>/dev/null || echo host)"
+  printf '%s' "$n"
+}
+looks_like_secret() { # exit 0 if the text looks like it holds a key (prints nothing)
+  printf '%s' "$1" | grep -Eq '[A-Za-z0-9_-]{32,}|(^|[^A-Za-z0-9_-])(sk-|ghp_|gho_|github_pat_|xox|AKIA)'
+}
+
+cmd_ledger() {
+  local sub="${1:-}" f
+  [ $# -gt 0 ] && shift
+  shared_init || return 1
+  f="$SHARED_DIR/LEDGER.md"
+  case "$sub" in
+    add)
+      local by="" text=""
+      while [ $# -gt 0 ]; do
+        case "$1" in
+          --by) [ $# -ge 2 ] || { say "--by 需要名字" "--by needs a name"; return 2; }; by="$2"; shift ;;
+          *) text="${text:+$text }$1" ;;
+        esac
+        shift
+      done
+      [ -n "$text" ] || { say '用法: aibot ledger add "文字" [--by 名字]' 'usage: aibot ledger add "text" [--by name]'; return 2; }
+      case "$text$by" in *$'\n'* | *$'\r'*) say "拒絕：帳本一次只能寫一行" "refused: the ledger takes one line at a time"; return 1 ;; esac
+      text=$(printf '%s' "$text" | tr -d '[:cntrl:]')
+      by=$(printf '%s' "${by:-$(bot_name)}" | tr -d '[:cntrl:]')
+      by="${by:0:64}"
+      [ -n "$text" ] || { say "拒絕：內容是空的" "refused: empty text"; return 1; }
+      if [ "${#text}" -gt 500 ]; then say "拒絕：一行最多 500 字元" "refused: a line may be at most 500 characters"; return 1; fi
+      if looks_like_secret "$text" || looks_like_secret "$by"; then
+        say "拒絕：這看起來像金鑰。別把金鑰寫進共用帳本" "refused: this looks like a secret. Do not write secrets into the shared ledger"
+        return 1
+      fi
+      ( umask 077; flock -w 10 9 || exit 1; printf '%s %s %s\n' "$(date '+%Y-%m-%d %H:%M')" "$by" "$text" >&9 ) 9>>"$f" ||
+        { say "寫入失敗（鎖不到帳本）" "write failed (could not lock the ledger)"; return 1; }
+      ;;
+    tail)
+      local n="${1:-20}"
+      case "$n" in "" | *[!0-9]*) say "用法: aibot ledger tail [行數]" "usage: aibot ledger tail [N]"; return 2 ;; esac
+      [ -f "$f" ] && tail -n "$n" -- "$f"
+      return 0
+      ;;
+    grep)
+      [ $# -ge 1 ] || { say "用法: aibot ledger grep 字" "usage: aibot ledger grep WORD"; return 2; }
+      [ -f "$f" ] || return 1
+      grep -iF -- "$*" "$f"
+      ;;
+    *) say '用法: aibot ledger add "文字" [--by 名字] | tail [N] | grep 字' 'usage: aibot ledger add "text" [--by name] | tail [N] | grep WORD'; return 2 ;;
+  esac
+}
+
+lock_holder_field() { sed -n "s/^$2=//p" -- "$1" 2>/dev/null | head -n 1; }
+lock_holder_alive() { # holder file -> 0 if its pid is alive
+  local p
+  p=$(lock_holder_field "$1" pid)
+  case "$p" in "" | *[!0-9]*) return 1 ;; esac
+  kill -0 "$p" 2>/dev/null
+}
+lock_holder_text() { # holder file -> "who (pid N) since TIME"
+  local h="$1" who pid since
+  if [ -f "$h" ] && lock_holder_alive "$h"; then
+    who=$(lock_holder_field "$h" by); pid=$(lock_holder_field "$h" pid); since=$(lock_holder_field "$h" since)
+    printf '%s (pid %s) %s %s' "$who" "$pid" "$(m '從' 'since')" "$(date -d "@$since" '+%F %H:%M' 2>/dev/null || echo '?')"
+  else
+    m '不明（可能剛好放掉）' 'unknown (maybe just released)'
+  fi
+}
+
+cmd_lock() {
+  local name wait=600 fd hold lf n any probe
+  shared_init || return 1
+  if [ "${1:-}" = list ]; then
+    any=0
+    for lf in "$SHARED_DIR"/locks/*.lock; do
+      [ -e "$lf" ] || continue
+      n=$(basename "$lf" .lock)
+      hold="$SHARED_DIR/locks/$n.holder"
+      { exec {probe}>>"$lf"; } 2>/dev/null || continue
+      if flock -n "$probe"; then exec {probe}>&-; continue; fi
+      exec {probe}>&-
+      if [ -f "$hold" ] && lock_holder_alive "$hold"; then
+        any=1
+        printf '%s  %s\n' "$n" "$(lock_holder_text "$hold")"
+      fi
+    done
+    [ "$any" = 1 ] || say "目前沒有被拿著的鎖" "no lock is currently held"
+    return 0
+  fi
+  name="${1:-}"
+  [ $# -gt 0 ] && shift
+  if ! [[ "$name" =~ ^[A-Za-z0-9._-]{1,64}$ ]]; then
+    say "用法: aibot lock 名字 [--wait 秒] -- 指令...（名字只能用英數 . _ -，最長 64）" "usage: aibot lock NAME [--wait SECONDS] -- command...  (NAME: letters digits . _ - , max 64)"
+    return 2
+  fi
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --wait) [[ "${2:-}" =~ ^[0-9]+$ ]] || { say "--wait 需要整數秒" "--wait needs whole seconds"; return 2; }; wait="$2"; shift 2 ;;
+      --) shift; break ;;
+      *) say "用法: aibot lock 名字 [--wait 秒] -- 指令..." "usage: aibot lock NAME [--wait SECONDS] -- command..."; return 2 ;;
+    esac
+  done
+  [ $# -gt 0 ] || { say "用法: aibot lock 名字 [--wait 秒] -- 指令..." "usage: aibot lock NAME [--wait SECONDS] -- command..."; return 2; }
+  hold="$SHARED_DIR/locks/$name.holder"
+  exec {fd}>>"$SHARED_DIR/locks/$name.lock" || return 1
+  if ! flock -w "$wait" "$fd"; then
+    printf '%s%s\n' "$(m "等不到鎖 $name（等了 ${wait} 秒）。目前拿著的是: " "could not get lock $name (waited ${wait}s). Held by: ")" "$(lock_holder_text "$hold")" >&2
+    return 75
+  fi
+  printf 'by=%s\npid=%s\nsince=%s\n' "$(bot_name | tr -d '[:cntrl:]')" "$$" "$(now)" >"$hold.$$" && mv -f -- "$hold.$$" "$hold"
+  # the command does not inherit the lock fd: if this wrapper dies, the lock frees itself
+  ( exec {fd}>&-; exec "$@" )
 }
 
 usage() {
@@ -1056,6 +1521,10 @@ aibot $AIBOT_VERSION
   notify "message" send to all configured channels
   doctor           health check
   tg-chatid        find your Telegram chat id (message your bot first)
+  audit [--json]   list the logins/keys every bot on this computer can see (read-only, never shows contents)
+  ledger add "text" [--by NAME] | tail [N] | grep WORD   shared notebook for several bots
+  lock NAME [--wait SEC] -- command...   run a command only when nobody else holds lock NAME (exit 75 if busy)
+  lock list        show locks that are held right now
   uninstall [--yes]
 EOF
 }
@@ -1063,6 +1532,7 @@ EOF
 main() {
   local cmd="${1:-help}"
   [ $# -gt 0 ] && shift
+  [ "$cmd" = audit ] && AUD_RO=1
   load
   case "$cmd" in
     status) cmd_status ;;
@@ -1076,6 +1546,9 @@ main() {
     guard-tick) guard_tick ;;
     guard-loop) guard_loop ;;
     tg-chatid) tg_chatid ;;
+    audit) cmd_audit "$@" ;;
+    ledger) cmd_ledger "$@" ;;
+    lock) cmd_lock "$@" ;;
     version | --version) echo "$AIBOT_VERSION" ;;
     *) usage ;;
   esac

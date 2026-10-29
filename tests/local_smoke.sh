@@ -14,6 +14,6 @@ chk "--dry-run" bash "$ROOT/install.sh" --dry-run --with tmux,claude,remote,guar
 chk "dry-run touched nothing" test ! -e "$H/.aibot"
 chk "no tty without --with fails fast" bash -c "! bash '$ROOT/install.sh' </dev/null"
 lines=$(wc -l <"$ROOT/install.sh")
-chk "install.sh <= 1500 lines ($lines)" test "$lines" -le 1500
+chk "install.sh <= 1800 lines ($lines)" test "$lines" -le 1800
 rm -rf "$H"
 exit "$FAILS"

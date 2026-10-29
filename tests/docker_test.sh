@@ -25,7 +25,7 @@ start() { # start name image
 }
 
 prep_root() { # prep_root name extra-packages
-  $D exec -u 0 "$1" bash -c "export DEBIAN_FRONTEND=noninteractive; apt-get update -qq >/dev/null && apt-get install -y -qq curl ca-certificates $2 >/dev/null 2>&1"
+  $D exec -u 0 "$1" bash -c "export DEBIAN_FRONTEND=noninteractive; apt-get update -qq >/dev/null && apt-get install -y -qq curl ca-certificates jq $2 >/dev/null 2>&1"
 }
 
 pull_if_missing ubuntu:24.04
@@ -50,7 +50,7 @@ wait "$pb"; rb=$?
 wait "$pc"; rc=$?
 cat "$LOG/A.log" "$LOG/B.log" "$LOG/C.log"
 
-# shellcheck (separate throw-away container)
+# static analysis in a separate throw-away container
 pull_if_missing koalaman/shellcheck:stable
 $D run --rm --memory 1g -v "$SRC:/mnt:ro" koalaman/shellcheck:stable -s bash -x /mnt/install.sh /mnt/bin/aibot /mnt/tools/sync-embed.sh /mnt/tests/inner.sh /mnt/tests/docker_test.sh >"$LOG/shellcheck.log" 2>&1
 echo "SHELLCHECK exit=$? (log: $LOG/shellcheck.log)"

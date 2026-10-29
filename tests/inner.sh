@@ -127,7 +127,7 @@ if [ "$HAS_SUDO" = 1 ]; then
 fi
 
 # ---- 8. secrets are never printed (fake telegram token)
-FAKE="1234567890:AAFAKEtokenForTestingOnly_abcdef"
+FAKE="0000000000:AAFAKEtokenForTestingOnly_abcdef"
 out=$(AIBOT_TG_TOKEN="$FAKE" AIBOT_TG_CHAT=12345 bash "$SRC/install.sh" --lang en --with notify-telegram --yes 2>&1)
 case "$out" in *"$FAKE"*) fail "token leaked into installer output" ;; *) pass "token not in installer output" ;; esac
 ok_if "token stored in secrets.env" grep -q "AIBOT_TG_TOKEN" "$HOME/.aibot/secrets.env"
@@ -271,8 +271,8 @@ grep -q ' zed named by env$' "$SH/.aibot/shared/LEDGER.md" && pass "ledger: defa
 ab ledger add "$(printf 'bad\atext')" --by C >/dev/null 2>&1
 grep -q ' C badtext$' "$SH/.aibot/shared/LEDGER.md" && pass "ledger: control characters stripped" || fail "ledger: control chars"
 n0=$(wc -l <"$SH/.aibot/shared/LEDGER.md")
-abq ledger add "token ghp_abcdefghijklmnop" && fail "ledger accepted ghp_" || pass "ledger refuses ghp_ secret"
-abq ledger add "key sk-abc123" && fail "ledger accepted sk-" || pass "ledger refuses sk- secret"
+abq ledger add "token ghp_FAKE" && fail "ledger accepted ghp_" || pass "ledger refuses ghp_ secret"
+abq ledger add "key sk-FAKE" && fail "ledger accepted sk-" || pass "ledger refuses sk- secret"
 abq ledger add "AKIAIOSFODNN7EXAMPLE" && fail "ledger accepted AKIA" || pass "ledger refuses AKIA secret"
 abq ledger add "long ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789abcdef" && fail "ledger accepted 32+ char run" || pass "ledger refuses 32+ char key-like run"
 abq ledger add "$(printf 'one\ntwo')" && fail "ledger accepted 2 lines" || pass "ledger refuses multi-line"

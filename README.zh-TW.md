@@ -97,6 +97,15 @@ Grok Bot 一個帳號只有一台電腦，那就用 `aibot audit` 把不必要�
 2. 用手機打開畫面上的網址、登入、把代碼貼回來。
 3. 執行 `aibot restart`，再到手機的 Claude App 找這台主機。
 
+## 不讓機密進對話（選用）
+
+雲端主機很快就會累積權杖和 `.env` 檔，代理讀到的內容都會進到對話裡。[hushhook](https://github.com/monarchsofchaos004-gif/hushhook) 會遮蔽工具輸出裡的機密、擋下敏感檔案的讀取，也會擋掉大量輸出，全部在你自己的機器上執行。在 Claude Code 裡輸入：
+
+```text
+/plugin marketplace add monarchsofchaos004-gif/hushhook
+/plugin install hushhook@hushhook
+```
+
 ## `aibot` 指令
 
 `aibot status | start | stop | restart | logs [guard|install] [-f] | notify "訊息" | doctor | tg-chatid | audit [--json] | ledger add/tail/grep | lock 名字 -- 指令／lock list | uninstall [--yes]`

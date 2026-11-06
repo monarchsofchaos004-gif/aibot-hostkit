@@ -106,6 +106,15 @@ Non-interactive variables: `AIBOT_TG_TOKEN` (+ optional `AIBOT_TG_CHAT`), `AIBOT
 2. Open the URL on your phone, sign in, paste the code back.
 3. `aibot restart`, then find the machine in the Claude phone app.
 
+## Keep secrets out of the conversation (optional)
+
+A cloud machine soon collects tokens and `.env` files, and whatever the agent reads goes into the conversation. [hushhook](https://github.com/monarchsofchaos004-gif/hushhook) masks secrets in tool output, blocks reads of sensitive files and stops big dumps, all on your own machine. Inside Claude Code:
+
+```text
+/plugin marketplace add monarchsofchaos004-gif/hushhook
+/plugin install hushhook@hushhook
+```
+
 ## The `aibot` command
 
 `aibot status | start | stop | restart | logs [guard|install] [-f] | notify "text" | doctor | tg-chatid | audit [--json] | ledger add/tail/grep | lock NAME -- cmd / lock list | uninstall [--yes]`
